@@ -1,125 +1,163 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
-    "sort"
-    "os"
-    "io"
-    "strings"
-	"github.com/armon/consul-api"
-    "github.com/docopt/docopt-go"
+	"io/ioutil"
+	"log"
+	"net/url"
+	"os"
+	"sort"
+
+	"github.com/brycekahle/goamz/aws"
+	"github.com/brycekahle/goamz/s3"
+	consul "github.com/hashicorp/consul/api"
 )
 
+var (
+	restoreMode bool
+	overwrite   bool
+)
 
-//type KVPair struct {
-//    Key         string
-//    CreateIndex uint64
-//    ModifyIndex uint64
-//    LockIndex   uint64
-//    Flags       uint64
-//    Value       []byte
-//    Session     string
-//}
+func init() {
+	flag.BoolVar(&restoreMode, "restore", false, "Restore data instead of backing up")
+	flag.BoolVar(&overwrite, "f", false, "Overwrite existing files")
+}
 
-type ByCreateIndex consulapi.KVPairs
+type ByCreateIndex consul.KVPairs
 
-func (a ByCreateIndex) Len() int           { return len(a) }
-func (a ByCreateIndex) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByCreateIndex) Len() int      { return len(a) }
+func (a ByCreateIndex) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
 //Sort the KVs by createIndex
 func (a ByCreateIndex) Less(i, j int) bool { return a[i].CreateIndex < a[j].CreateIndex }
 
-
-func backup(ipaddress string, outfile string) {
-
-    config := consulapi.DefaultConfig()
-    config.Address = ipaddress
-
-
-	client, _ := consulapi.NewClient(config)
+func backup(outfile string) {
+	client, _ := consul.NewClient(consul.DefaultConfig())
 	kv := client.KV()
 
 	pairs, _, err := kv.List("/", nil)
-    if err != nil {
-            panic(err)
-        }
-    sort.Sort(ByCreateIndex(pairs))
+	if err != nil {
+		panic(err)
+	}
+	sort.Sort(ByCreateIndex(pairs))
 
-    outstring := ""
+	outpairs := map[string]string{}
 	for _, element := range pairs {
-        outstring += fmt.Sprintf("%s:%s\n", element.Key, element.Value)
+		outpairs[element.Key] = string(element.Value)
 	}
 
-    file, err := os.Create(outfile)
-    if err != nil {
-        panic(err)
-    }
+	data, err := json.MarshalIndent(outpairs, "", "  ")
+	if err != nil {
+		panic(err)
+	}
 
-    if _, err := file.Write([]byte(outstring)[:]); err != nil {
-        panic(err)
-    }
+	writeOutput(data, outfile)
 }
 
-/* File needs to be in the following format:
-    KEY1:VALUE1
-    KEY2:VALUE2
-*/
-func restore(ipaddress string, infile string) {
+func writeOutput(data []byte, outfile string) {
+	u, err := url.Parse(outfile)
+	if err != nil {
+		panic(err)
+	}
 
-    config := consulapi.DefaultConfig()
-    config.Address = ipaddress
+	if u.Scheme == "" {
+		if _, err := os.Stat(outfile); !overwrite && err == nil {
+			log.Fatalf("%s exists. Use -f to force overwrite", outfile)
+			return
+		}
 
-    file, err := os.Open(infile)
-    if err != nil {
-    	panic(err)
-    }
+		if err = ioutil.WriteFile(outfile, data, 0644); err != nil {
+			panic(err)
+		}
+		return
+	}
 
-    data := make([]byte, 100)
-    _, err = file.Read(data)
-    if err != nil && err != io.EOF { panic(err) }
+	if u.Scheme == "s3" {
+		auth, err := aws.EnvAuth()
+		if err != nil {
+			panic(err)
+		}
 
-    client, _ := consulapi.NewClient(config)
-    kv := client.KV()
+		md5bytes := md5.Sum(data)
+		sum := base64.StdEncoding.EncodeToString(md5bytes[:])
 
-    for _, element := range strings.Split(string(data), "\n") {
-        kvp := strings.Split(element, ":")
+		awss3 := s3.New(auth, aws.GetRegion("us-west-2"))
+		bucket := awss3.Bucket(u.Host)
+		version, err := bucket.Put(u.Path, data, "application/json", s3.Private, s3.Options{ContentMD5: sum})
+		if err != nil {
+			panic(err)
+		}
 
-        if len(kvp) > 1 {
-            p := &consulapi.KVPair{Key: kvp[0], Value: []byte(kvp[1])}
-            _, err := kv.Put(p, nil)
-            if err != nil {
-                panic(err)
-            }
-        }
-    }
+		log.Printf("Backed up to %s%s version %s", u.Host, u.Path, version)
+		return
+	}
+
+	log.Fatalf("Unknown scheme %s", u.Scheme)
+}
+
+func readInput(infile string) ([]byte, error) {
+	u, err := url.Parse(infile)
+	if err != nil {
+		return nil, err
+	}
+
+	if u.Scheme == "" {
+		return ioutil.ReadFile(infile)
+	}
+
+	if u.Scheme == "s3" {
+		auth, err := aws.EnvAuth()
+		if err != nil {
+			return nil, err
+		}
+		awss3 := s3.New(auth, aws.GetRegion("us-west-2"))
+		bucket := awss3.Bucket(u.Host)
+
+		return bucket.Get(u.Path)
+	}
+
+	return nil, fmt.Errorf("Unknown scheme %s", u.Scheme)
+}
+
+func restore(infile string) {
+	data, err := readInput(infile)
+	if err != nil {
+		panic(err)
+	}
+
+	inpairs := map[string]string{}
+	if err = json.Unmarshal(data, &inpairs); err != nil {
+		panic(err)
+	}
+
+	client, _ := consul.NewClient(consul.DefaultConfig())
+	kv := client.KV()
+
+	for k, v := range inpairs {
+		log.Printf("restoring %s:%s", k, v)
+		p := &consul.KVPair{Key: k, Value: []byte(v)}
+		_, err := kv.Put(p, nil)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 func main() {
+	flag.Parse()
+	if len(flag.Args()) == 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
 
-    usage := `Consul Backup and Restore tool.
-
-Usage:
-  consul-backup [-i IP:PORT] [--restore] <filename>
-  consul-backup -h | --help
-  consul-backup --version
-
-Options:
-  -h --help     Show this screen.
-  --version     Show version.
-  -i, --address=IP:PORT  The HTTP endpoint of Consul [default: 127.0.0.1:8500].
-  -r, --restore     Activate restore mode`
-
-    arguments, _ := docopt.Parse(usage, nil, true, "consul-backup 1.0", false)
-    // fmt.Println(arguments)
-    if arguments["--restore"] == true {
-		fmt.Println("Restore mode:")
-		fmt.Printf("Warning! This will overwrite existing kv. Press [enter] to continue; CTL-C to exit")
-		fmt.Scanln()
-		fmt.Println("Restoring KV from file: ", arguments["<filename>"].(string))
-        restore(arguments["--address"].(string), arguments["<filename>"].(string))
-    } else {
-		fmt.Println("Backup mode:")
-		fmt.Println("KV store will be backed up to file: ", arguments["<filename>"].(string))
-        backup(arguments["--address"].(string), arguments["<filename>"].(string))
-    }
-
+	filename := flag.Args()[0]
+	if restoreMode {
+		restore(filename)
+	} else {
+		backup(filename)
+	}
 }

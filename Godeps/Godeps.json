@@ -1,0 +1,19 @@
+{
+	"ImportPath": "github.com/majorleaguesoccer/consul-backup",
+	"GoVersion": "go1.4.1",
+	"Deps": [
+		{
+			"ImportPath": "github.com/brycekahle/goamz/aws",
+			"Rev": "1502acd1ee83958679e21808b66d3889fd58d928"
+		},
+		{
+			"ImportPath": "github.com/brycekahle/goamz/s3",
+			"Rev": "1502acd1ee83958679e21808b66d3889fd58d928"
+		},
+		{
+			"ImportPath": "github.com/hashicorp/consul/api",
+			"Comment": "v0.5.0rc1-55-g255d763",
+			"Rev": "255d76362333c89f14988ae9922eb0851bf968b3"
+		}
+	]
+}
