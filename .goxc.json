@@ -1,0 +1,13 @@
+{
+  "ArtifactsDest": "./",
+  "Tasks": [
+    "validate",
+    "xc"
+  ],
+  "Arch": "amd64",
+  "Os": "linux",
+  "ConfigVersion": "0.9",
+  "Env": [
+    "CGO_ENABLED=0"
+  ]
+}
